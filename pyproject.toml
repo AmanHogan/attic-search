@@ -1,0 +1,58 @@
+[project]
+name = "attic-search"
+version = "0.1.0"
+description = "Ask natural-language questions about scanned paper, fully locally."
+readme = "PLAN.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "imagehash>=4.3",
+    "pillow>=11.0",
+    "pymupdf>=1.25",
+    "python-ulid>=3.0",
+]
+
+[project.scripts]
+attic = "attic.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=8.0",
+    "ruff>=0.16.9",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "attic"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes: unused imports/variables, undefined names
+    "I",        # import sorting
+    "B",        # bugbear: likely bugs
+    "UP",       # pyupgrade: modern syntax for 3.13
+    "SIM",      # simplifications
+    "PTH",      # pathlib over os.path
+    "RUF",      # ruff-specific
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+untyped_calls_exclude = ["pymupdf"]
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["pymupdf", "imagehash"]
+ignore_missing_imports = true

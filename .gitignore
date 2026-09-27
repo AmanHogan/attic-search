@@ -1,0 +1,56 @@
+# --- Personal data: never commit ---
+# Originals, renders, OCR output, thumbs, and the DB are personal and large.
+# Back these up via Time Machine / encrypted offsite (Phase 6), not git.
+archive/
+inbox/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.pdf
+!docs/**/*.pdf
+
+# Vector store data
+qdrant_storage/
+qdrant_data/
+*.snapshot
+
+# Eval runs / logs / scratch output
+runs/
+logs/
+*.log
+scratch/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# --- Editors / OS ---
+.DS_Store
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+CLAUDE.md
+PLAN.md
