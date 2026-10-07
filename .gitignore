@@ -23,6 +23,13 @@ logs/
 *.log
 scratch/
 
+# --- Node / Next.js ---
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
 # --- Python ---
 __pycache__/
 *.py[cod]
