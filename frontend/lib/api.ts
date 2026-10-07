@@ -102,6 +102,34 @@ export interface Answer {
   sources: SearchHit[];
 }
 
+export interface Chat {
+  chat_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One turn in a chat. The answer fields are filled only on assistant messages. */
+export interface ChatMessage {
+  message_id: string;
+  chat_id: string;
+  role: "user" | "assistant";
+  text: string;
+  created_at: string;
+  /** User only: the follow-up as rewritten for search, or null if used as written. */
+  standalone: string | null;
+  route: "rag" | "sql" | null;
+  sql: string | null;
+  note: string | null;
+  sources: SearchHit[];
+  rows: Record<string, unknown>[];
+}
+
+export interface ChatDetail {
+  chat: Chat;
+  messages: ChatMessage[];
+}
+
 export interface Stats {
   documents: number;
   pages: number;

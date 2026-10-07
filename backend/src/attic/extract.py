@@ -85,6 +85,14 @@ a game, a web app)
 """System prompt for describing a code project from its files."""
 
 
+FINANCIAL_RE = re.compile(
+    r"\$\s?\d|\b(invoice|receipt|subtotal|total|balance|amount due|statement|bill|billing|payment|paid"
+    r"|refund|tax|estimate|quote|award|scholarship|tuition|premium|deductible)\b",
+    re.IGNORECASE,
+)
+"""Text that suggests money: in `--fast` mode such documents still go to the full model."""
+
+
 PaperType = Literal[
     "receipt",
     "estimate",
@@ -258,13 +266,17 @@ class ExtractResult:
 
 
 def _clean_date(value: str | None) -> str | None:
-    """Return the value if it's a real YYYY-MM-DD date, else None."""
+    """Return the value if it's a real YYYY-MM-DD date no later than today, else None.
+
+    A paper can't be written in the future, so a future date is the model inventing one.
+    """
     if not value:
         return None
     try:
-        return date.fromisoformat(value.strip()).isoformat()
+        parsed = date.fromisoformat(value.strip())
     except ValueError:
         return None
+    return parsed.isoformat() if parsed <= date.today() else None
 
 
 def _clean_range(start: str | None, end: str | None) -> tuple[str | None, str | None]:
@@ -430,14 +442,15 @@ def _describe(
         scanned_at (str | None): Scan date, so the model knows the latest possible date.
         image (Path | None): First page image, or None if there is none.
         single_page (bool): Whether the document has exactly one page.
-        fast (bool): Use the small text-only `EXTRACT_FAST_MODEL` and never caption.
+        fast (bool): Use the small text-only `EXTRACT_FAST_MODEL`, unless the text looks
+            financial (`FINANCIAL_RE`): money and dates matter there, and the small model
+            misses them, so those still go to `EXTRACT_MODEL`.
 
     Returns:
         tuple[DocFacts, str | None]: The model's facts, and a caption for a photo.
     """
-    if fast:
+    if fast and not FINANCIAL_RE.search(text):
         facts = _ask_llm(text, scanned_at, config.EXTRACT_FAST_MODEL)
-        _fill_missing_total(facts, text, config.EXTRACT_FAST_MODEL)
         return facts, None
     facts = _ask_llm(text, scanned_at)
     _fill_missing_total(facts, text)
@@ -477,10 +490,254 @@ def _start_job(
     return pool.submit(_describe, text, job["scanned_at"], image, pages == 1, fast), text
 
 
+def _money_second_pass(text: str, kind: str, model: str | None = None) -> MoneyFacts:
+    """Ask the model for just the total, which it finds far more reliably than as one field among many.
+
+    Award letters get their own prompt: the receipt wording ("grand total", "amount due", "not a
+    single line item") makes the model return null for an amount written out in a sentence.
+
+    Args:
+        text (str): The document's OCR text.
+        kind (str): Money kind from `_kind`, which picks the prompt.
+        model (str | None): Ollama model to use; None for `EXTRACT_MODEL`.
+
+    Returns:
+        MoneyFacts: Party, date, and grand total.
+    """
+    response = ollama.chat(
+        model=model or config.EXTRACT_MODEL,
+        messages=[
+            {"role": "system", "content": AWARD_MONEY_PROMPT if kind == "award" else MONEY_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        format=MoneyFacts.model_json_schema(),
+        options={"temperature": 0, "num_ctx": config.EXTRACT_NUM_CTX},
+    )
+    return MoneyFacts.model_validate_json(response.message.content or "")
+
+
+def _fill_missing_total(facts: DocFacts, text: str, model: str | None = None) -> None:
+    """Run the money-only pass when the document shows a total the main pass didn't pick up.
+
+    Args:
+        facts (DocFacts): The model's answer, updated in place.
+        text (str): The document's OCR text.
+        model (str | None): Ollama model to use; None for `EXTRACT_MODEL`.
+    """
+    if facts.amount and facts.amount.total is not None:
+        return
+    if not re.search(r"\$\s?\d", text):
+        return
+    money = _money_second_pass(text, _kind(facts.title, text), model)
+    if money.grand_total is None:
+        return
+    if facts.amount is None:
+        facts.amount = AmountFacts(
+            party=money.party,
+            date=money.date,
+            total=money.grand_total,
+            odometer=None,
+            service=None,
+            category=None,
+        )
+    else:
+        facts.amount.total = money.grand_total
+        facts.amount.party = facts.amount.party or money.party
+        facts.amount.date = facts.amount.date or money.date
+
+
+def _ask_llm(text: str, scanned_at: str | None, model: str | None = None) -> DocFacts:
+    """Ask the local model for a document's metadata, forced into the `DocFacts` schema.
+
+    Args:
+        text (str): The document's OCR text.
+        scanned_at (str | None): Scan date, so the model knows the latest possible date.
+        model (str | None): Ollama model to use; None for `EXTRACT_MODEL`.
+
+    Returns:
+        DocFacts: The model's answer, validated against the schema.
+    """
+    response = ollama.chat(
+        model=model or config.EXTRACT_MODEL,
+        messages=[
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": f"Scan date: {scanned_at or 'unknown'}\n\nOCR text:\n{text}"},
+        ],
+        format=DocFacts.model_json_schema(),
+        options={"temperature": 0, "num_ctx": config.EXTRACT_NUM_CTX},
+    )
+    return DocFacts.model_validate_json(response.message.content or "")
+
+
+def _store_facts(
+    conn: sqlite3.Connection, job_id: str, doc_id: str, facts: DocFacts, text: str, caption: str | None
+) -> tuple[str | None, str | None]:
+    """Clean the model's answer and write it to documents, tags, people, amounts; mark the job done.
+
+    Everything is replaced, not merged, so re-running gives the same result.
+
+    Args:
+        conn (sqlite3.Connection): Open archive database.
+        job_id (str): Extract job to mark done.
+        doc_id (str): Document the facts describe.
+        facts (DocFacts): The model's answer.
+        text (str): The document's OCR text (used to tell awards and estimates from receipts).
+        caption (str | None): Description of the photo, for image-like documents.
+
+    Returns:
+        tuple[str | None, str | None]: The stored (date_start, date_end).
+    """
+    start, end = _clean_range(facts.date_start, facts.date_end)
+    people = _unique([_clean_name(p) for p in facts.people])
+    tags = _unique([t.strip().lower() for t in facts.tags])
+    # Small models sometimes call an invoice a "form", so keep money fields for any document
+    # with a total, and for estimates even without one (so they at least get listed).
+    amount = facts.amount
+    kind = _kind(facts.title, text)
+    if amount and amount.total is None and facts.doc_type != "receipt" and kind != "estimate":
+        amount = None
+
+    with conn:
+        conn.execute(
+            "UPDATE documents SET title = ?, doc_type = ?, doc_date_start = ?, doc_date_end = ?,"
+            " summary = ?, caption = ?, sensitive = ? WHERE doc_id = ?",
+            (
+                facts.title.strip(),
+                facts.doc_type,
+                start,
+                end,
+                facts.summary.strip(),
+                caption,
+                facts.sensitive,
+                doc_id,
+            ),
+        )
+        conn.execute("DELETE FROM tags WHERE doc_id = ?", (doc_id,))
+        conn.executemany("INSERT INTO tags (doc_id, tag) VALUES (?, ?)", [(doc_id, t) for t in tags])
+        conn.execute("DELETE FROM people WHERE doc_id = ?", (doc_id,))
+        conn.executemany("INSERT INTO people (doc_id, name) VALUES (?, ?)", [(doc_id, p) for p in people])
+        conn.execute("DELETE FROM amounts WHERE doc_id = ?", (doc_id,))
+        if amount:
+            conn.execute(
+                "INSERT INTO amounts (doc_id, kind, party, date, amount_cents, odometer, service, category)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    doc_id,
+                    kind,
+                    amount.party,
+                    _clean_date(amount.date),
+                    round(amount.total * 100) if amount.total is not None else None,
+                    amount.odometer,
+                    amount.service,
+                    amount.category,
+                ),
+            )
+        conn.execute(
+            "UPDATE jobs SET status = 'done', error = NULL, updated_at = ? WHERE job_id = ?",
+            (now(), job_id),
+        )
+        # Chunks carry a [type | date | title] header, so new facts mean the document needs re-indexing.
+        conn.execute(
+            "UPDATE jobs SET status = 'pending', updated_at = ? WHERE target_id = ? AND stage = ?",
+            (now(), doc_id, config.INDEX_STAGE),
+        )
+    return start, end
+
+
+def _project_context(conn: sqlite3.Connection, paths: Paths, doc_id: str, name: str) -> str:
+    """Build the text the model sees for a project: its name, file list, README, and main files.
+
+    Args:
+        conn (sqlite3.Connection): Open archive database.
+        paths (Paths): Archive locations.
+        doc_id (str): Project document.
+        name (str): Project folder name.
+
+    Returns:
+        str: The project's name, up to `PROJECT_TREE_FILES` file paths, its README, and the
+            first `PROJECT_HEAD_LINES` lines of `PROJECT_HEAD_FILES` source files, cut to
+            `PROJECT_MAX_CHARS`.
+    """
+    rows = conn.execute(
+        "SELECT r.source_filename AS path, t.text_path FROM pages p"
+        " JOIN raw_files r ON r.sha256 = p.raw_sha256"
+        " JOIN page_text t ON t.page_id = p.page_id AND t.is_active = 1"
+        " WHERE p.doc_id = ? ORDER BY p.page_no",
+        (doc_id,),
+    ).fetchall()
+    texts = {row["path"]: (paths.archive / row["text_path"]).read_text() for row in rows}
+    tree = "\n".join(sorted(texts)[: config.PROJECT_TREE_FILES])
+    readme = next((t for p, t in texts.items() if Path(p).name.lower().startswith("readme")), "")
+    code = [p for p in texts if not p.lower().endswith(".md")]
+    main = sorted(code, key=lambda p: (Path(p).stem.lower() not in config.PROJECT_MAIN_NAMES, -len(texts[p])))
+    heads = "\n\n".join(
+        f"--- {p} ---\n" + "\n".join(texts[p].splitlines()[: config.PROJECT_HEAD_LINES])
+        for p in main[: config.PROJECT_HEAD_FILES]
+    )
+    context = f"Project: {name}\n\nFiles:\n{tree}\n\nREADME:\n{readme[:1500]}\n\nMain files:\n{heads}"
+    return context[: config.PROJECT_MAX_CHARS]
+
+
+def _ask_project(context: str, model: str | None = None) -> ProjectFacts:
+    """Ask the local model to describe a project, forced into the `ProjectFacts` schema.
+
+    Args:
+        context (str): Text from `_project_context`.
+        model (str | None): Ollama model to use; None for `EXTRACT_MODEL`.
+
+    Returns:
+        ProjectFacts: The model's answer, validated against the schema.
+    """
+    response = ollama.chat(
+        model=model or config.EXTRACT_MODEL,
+        messages=[
+            {"role": "system", "content": PROJECT_PROMPT},
+            {"role": "user", "content": context},
+        ],
+        format=ProjectFacts.model_json_schema(),
+        options={"temperature": 0, "num_ctx": config.EXTRACT_NUM_CTX},
+    )
+    return ProjectFacts.model_validate_json(response.message.content or "")
+
+
+def _store_project(conn: sqlite3.Connection, job_id: str, doc_id: str, facts: ProjectFacts) -> None:
+    """Write a project's description and mark the job done, keeping the tags ingest set.
+
+    Tags with a colon (`project:`, `course:`, ...) were set by ingest from the folder name
+    and are kept; the model's own tags are replaced on every run.
+
+    Args:
+        conn (sqlite3.Connection): Open archive database.
+        job_id (str): Extract job to mark done.
+        doc_id (str): Project document.
+        facts (ProjectFacts): The model's answer.
+    """
+    tags = _unique([t.strip().lower() for t in facts.tags])
+    with conn:
+        conn.execute(
+            "UPDATE documents SET title = ?, summary = ? WHERE doc_id = ?",
+            (facts.title.strip(), facts.summary.strip(), doc_id),
+        )
+        conn.execute("DELETE FROM tags WHERE doc_id = ? AND instr(tag, ':') = 0", (doc_id,))
+        conn.executemany(
+            "INSERT OR IGNORE INTO tags (doc_id, tag) VALUES (?, ?)", [(doc_id, t) for t in tags]
+        )
+        conn.execute(
+            "UPDATE jobs SET status = 'done', error = NULL, updated_at = ? WHERE job_id = ?",
+            (now(), job_id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = 'pending', updated_at = ? WHERE target_id = ? AND stage = ?",
+            (now(), doc_id, config.INDEX_STAGE),
+        )
+
+
 # --- end private functions ---
 
 
-def run_extract(conn: sqlite3.Connection, paths: Paths, limit: int | None = None) -> Iterator[ExtractResult]:
+def run_extract(
+    conn: sqlite3.Connection, paths: Paths, limit: int | None = None, fast: bool = False
+) -> Iterator[ExtractResult]:
     """Queue ready documents, then extract metadata for each pending one, yielding as each finishes.
 
     Model calls run in `EXTRACT_WORKERS` threads so Ollama can serve several documents at
@@ -491,7 +748,8 @@ def run_extract(conn: sqlite3.Connection, paths: Paths, limit: int | None = None
     Args:
         conn (sqlite3.Connection): Open archive database.
         paths (Paths): Archive locations.
-        limit (int | None): Process at most this many pending documents; None for all.
+        limit (int | None): Process at most this many documents (skipped photos don't count);
+            None for all.
         fast (bool): Use the small text-only `EXTRACT_FAST_MODEL`; photo-like documents are
             skipped (status "skipped") and stay pending for a normal run.
 
@@ -511,8 +769,9 @@ def run_extract(conn: sqlite3.Connection, paths: Paths, limit: int | None = None
             " FROM jobs j WHERE j.stage = ? AND j.version = ? AND j.status = 'pending'"
             " ORDER BY j.job_id",
             (config.EXTRACT_STAGE, config.EXTRACT_STAGE_VERSION),
-        ).fetchall()[:limit]
+        ).fetchall()
     )
+    started_count = 0
 
     def fail(job: sqlite3.Row, error: Exception) -> ExtractResult:
         with conn:
@@ -527,7 +786,11 @@ def run_extract(conn: sqlite3.Connection, paths: Paths, limit: int | None = None
     with ThreadPoolExecutor(max_workers=config.EXTRACT_WORKERS) as pool:
         while True:
             # Keep a couple of jobs queued per worker, so a worker never waits on a database read.
-            while len(running) < config.EXTRACT_WORKERS * 2 and (job := next(jobs, None)):
+            while (
+                len(running) < config.EXTRACT_WORKERS * 2
+                and (limit is None or started_count < limit)
+                and (job := next(jobs, None))
+            ):
                 try:
                     started = _start_job(pool, conn, paths, job, fast)
                 except Exception as e:
@@ -538,6 +801,7 @@ def run_extract(conn: sqlite3.Connection, paths: Paths, limit: int | None = None
                     continue
                 future, text = started
                 running[future] = (job, text)
+                started_count += 1
             if not running:
                 return
             done, _ = wait(running, return_when=FIRST_COMPLETED)

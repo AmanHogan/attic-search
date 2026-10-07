@@ -179,7 +179,7 @@ CAPTION_MAX_SIDE = 1024
 """Photos are shrunk to this many pixels on the long side before captioning; this keeps the call fast."""
 
 EXTRACT_FAST_MODEL = "qwen2.5:3b"
-"""Small text-only model for `attic extract --fast`: about twice as fast, less accurate, no images."""
+"""Small text-only model for `attic extract --fast` (non-financial text only): about twice as fast."""
 
 EXTRACT_MAX_CHARS = 4_000
 """Longest document text sent to the model; longer documents are cut off."""
@@ -226,6 +226,18 @@ which scores from one.
 
 ASK_MODEL = "qwen2.5vl:7b"
 """Ollama model that routes questions, writes SQL, and writes answers."""
+
+CHAT_REWRITE_MODEL = "qwen2.5:3b"
+"""Model that rewrites a chat follow-up into a standalone question: a small, quick job."""
+
+CHAT_HISTORY_TURNS = 3
+"""How many earlier question/answer pairs the rewrite sees."""
+
+CHAT_TITLE_CHARS = 60
+"""A new chat is titled with its first question, cut to this many characters."""
+
+CHAT_DEFAULT_TITLE = "New chat"
+"""Title of a chat that has no messages yet."""
 
 ASK_SOURCES = 5
 """How many search results the model reads to answer a RAG question."""

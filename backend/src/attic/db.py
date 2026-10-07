@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 """Current schema version, stored in SQLite's `PRAGMA user_version`."""
 
 _VIEW_STATEMENTS = [
@@ -125,6 +125,29 @@ MIGRATIONS: dict[int, list[str]] = {
         "INSERT INTO documents SELECT doc_id, title, doc_type, doc_date_start, doc_date_end,"
         " collection_id, summary, caption, sensitive, created_at FROM documents_old",
         "DROP TABLE documents_old",
+    ],
+    # Chat sessions in the app: new tables only, nothing existing changes.
+    10: [
+        """CREATE TABLE IF NOT EXISTS chats (
+            chat_id    TEXT PRIMARY KEY,
+            title      TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS messages (
+            message_id   TEXT PRIMARY KEY,
+            chat_id      TEXT NOT NULL REFERENCES chats (chat_id),
+            role         TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+            text         TEXT NOT NULL,
+            standalone   TEXT,
+            route        TEXT,
+            sql          TEXT,
+            note         TEXT,
+            sources_json TEXT,
+            rows_json    TEXT,
+            created_at   TEXT NOT NULL
+        )""",
+        "CREATE INDEX IF NOT EXISTS messages_chat ON messages (chat_id)",
     ],
 }
 """SQL that upgrades the tables to each version from the one before it (views: see _refresh_views)."""

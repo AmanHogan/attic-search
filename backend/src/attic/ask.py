@@ -34,7 +34,8 @@ ROUTE_PROMPT = """You route questions about a personal archive of scanned paper 
 route:
 - "sql" ONLY for questions that need arithmetic or ranking across many documents: how much \
 (in total), how many, total, sum, average, the most/least expensive, when did I last, \
-most recent, list all of X.
+most recent, list all of X, and which or what projects or programs I wrote (code projects \
+are rows in a table, and short language names like C can't be searched as text).
 - "rag" for everything else, which is most questions: what a document says, who/what/where, \
 finding or naming a particular document, and "do I have…", "did I ever…", "what was the name of…". \
 When unsure, choose "rag".
@@ -54,7 +55,7 @@ You may only use these two views:
 documents_v: one row per document
   doc_id, title,
   doc_type (receipt|estimate|statement|letter|certificate|record|schoolwork|id_card|form|program
-            |note|photo|other),
+            |note|photo|project|other),
   date_start, date_end (YYYY-MM-DD text: when it was written; equal if exact; NULL if unknown),
   summary, caption (what a photo shows), sensitive (0/1),
   tags (comma-separated text), people (comma-separated text), page_count
@@ -91,6 +92,11 @@ Spending, paid, bought, receipts, invoices, bills mean kind = 'receipt'; quotes,
 kind = 'estimate'; scholarships, awards, grants, reimbursements, money received mean kind = 'award'; \
 if the question asks about several, don't filter on kind.
 - To show which document a single result came from, include title, party, and date.
+- Code the user wrote is stored as documents with doc_type = 'project', one row per project folder: \
+title and summary say what it is, and tags list its languages (c, cpp or c++, c#, python, java, \
+javascript, ...) and topics; a course project also has a tag like 'course:cse-5334'. Tags are \
+comma-separated, so match one tag exactly with ', ' || tags || ',' LIKE '%, c,%' (a bare \
+tags LIKE '%c%' would match nearly everything).
 
 Examples:
 Q: How much did UTA give me in scholarships?
@@ -116,6 +122,13 @@ SELECT max(date) AS last_oil_change FROM amounts_v WHERE service = 'oil change'
 Q: When did I last see the dentist?
 SELECT max(date_end) AS last_visit FROM documents_v \
 WHERE title LIKE '%dent%' OR summary LIKE '%dent%' OR tags LIKE '%dent%'
+Q: What projects did I write in C or C++?
+SELECT title, summary FROM documents_v WHERE doc_type = 'project' \
+AND (', ' || tags || ',' LIKE '%, c,%' OR ', ' || tags || ',' LIKE '%, cpp,%' \
+OR ', ' || tags || ',' LIKE '%, c++,%')
+Q: Which projects were for my data mining class?
+SELECT title, summary FROM documents_v WHERE doc_type = 'project' \
+AND (tags LIKE '%data mining%' OR summary LIKE '%data mining%')
 Q: How many letters do I have from grandma?
 SELECT count(*) AS letters FROM documents_v \
 WHERE doc_type = 'letter' AND (people LIKE '%grandma%' OR summary LIKE '%grandma%')"""
@@ -144,7 +157,8 @@ about the subject asked about.
 
 SQL_ANSWER_PROMPT = """You turn the result of a database query into a short answer to the user's question \
 about their own documents. Use only the rows given. Amounts are in dollars. If there are no rows, \
-say nothing matching was found. One or two sentences."""
+say nothing matching was found. One or two sentences, or a short bulleted list when the rows are \
+a list of items such as projects."""
 """System prompt for phrasing SQL results as an answer."""
 
 

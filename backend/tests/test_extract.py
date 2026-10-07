@@ -411,3 +411,85 @@ def test_only_photos_and_lone_sparse_pages_are_captioned(
     }
     assert rows["one.pdf"] == "a test photo"
     assert rows["many.pdf"] is None
+
+
+def test_fast_mode_uses_small_model_and_leaves_photos_pending(
+    paths: Paths, conn: sqlite3.Connection, make_pdf: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--fast sends plain text to the small model, money to the full one, and skips photos.
+
+    Args:
+        paths (Paths): Temporary archive locations.
+        conn (sqlite3.Connection): Initialized test database.
+        make_pdf (Callable[..., Path]): Test PDF factory.
+        monkeypatch (pytest.MonkeyPatch): Replaces the LLM calls.
+    """
+    make_pdf(paths.inbox / "photo.pdf", pages=1, text="x")
+    make_pdf(paths.inbox / "essay.pdf", pages=2, text="essay")  # more than one page: never a photo
+    make_pdf(paths.inbox / "receipt.pdf", pages=2, text="Jiffy Lube total $45.99")
+    ingest_inbox(conn, paths)
+    list(run_ocr(conn, paths))
+    models: list[str | None] = []
+
+    def fake(text: str, scanned_at: str | None, model: str | None = None) -> DocFacts:
+        models.append(model)
+        return facts(doc_type="schoolwork", amount=None)
+
+    monkeypatch.setattr(extract, "_ask_llm", fake)
+    monkeypatch.setattr(extract, "_caption", lambda image: pytest.fail("fast mode must not caption"))
+
+    results = {r.source_filename: r.status for r in run_extract(conn, paths, fast=True)}
+
+    assert results == {"photo.pdf": "skipped", "essay.pdf": "done", "receipt.pdf": "done"}
+    assert sorted(models, key=str) == sorted(
+        [config.EXTRACT_FAST_MODEL, None], key=str
+    )  # receipt: full model
+    pending = conn.execute(
+        "SELECT count(*) FROM jobs WHERE stage = 'extract' AND status = 'pending'"
+    ).fetchone()[0]
+    assert pending == 1  # the photo waits for a normal run
+
+
+def test_future_dates_are_dropped(
+    paths: Paths, conn: sqlite3.Connection, ocr_done: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A date after today is invented, so it is not stored.
+
+    Args:
+        paths (Paths): Temporary archive locations.
+        conn (sqlite3.Connection): Initialized test database.
+        ocr_done (None): One ingested, OCR'd document.
+        monkeypatch (pytest.MonkeyPatch): Replaces the LLM call.
+    """
+    use_answer(monkeypatch, facts(date_start="2050-12-31", date_end="2050-12-31"))
+
+    list(run_extract(conn, paths))
+
+    row = conn.execute("SELECT doc_date_start, doc_date_end FROM documents").fetchone()
+    assert tuple(row) == (None, None)
+
+
+def test_fast_limit_does_not_count_skipped_photos(
+    paths: Paths, conn: sqlite3.Connection, make_pdf: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Photos skipped in fast mode don't use up the limit.
+
+    Args:
+        paths (Paths): Temporary archive locations.
+        conn (sqlite3.Connection): Initialized test database.
+        make_pdf (Callable[..., Path]): Test PDF factory.
+        monkeypatch (pytest.MonkeyPatch): Replaces the LLM call.
+    """
+    for i in range(3):
+        make_pdf(paths.inbox / f"a_photo{i}.pdf", pages=1, text="x")
+    for i in range(2):
+        make_pdf(paths.inbox / f"b_essay{i}.pdf", pages=2, text="essay")
+    ingest_inbox(conn, paths)
+    list(run_ocr(conn, paths))
+    monkeypatch.setattr(
+        extract, "_ask_llm", lambda text, scanned_at, model=None: facts(doc_type="note", amount=None)
+    )
+
+    statuses = [r.status for r in run_extract(conn, paths, limit=2, fast=True)]
+
+    assert statuses.count("done") == 2 and statuses.count("skipped") == 3

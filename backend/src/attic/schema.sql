@@ -1,4 +1,4 @@
--- attic schema v9. Dates are ISO-8601 TEXT; booleans are INTEGER 0/1.
+-- attic schema v10. Dates are ISO-8601 TEXT; booleans are INTEGER 0/1.
 -- File paths are stored relative to the archive/ directory.
 
 -- Immutable originals: a PDF or a photo. One file may hold several documents.
@@ -125,6 +125,30 @@ CREATE TABLE route_log (
     sql          TEXT,
     answer       TEXT
 );
+
+-- A conversation in the app: an ordered list of messages.
+CREATE TABLE chats (
+    chat_id    TEXT PRIMARY KEY,      -- ULID
+    title      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- One turn in a chat, read back in insertion order (rowid).
+CREATE TABLE messages (
+    message_id   TEXT PRIMARY KEY,
+    chat_id      TEXT NOT NULL REFERENCES chats (chat_id),
+    role         TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    text         TEXT NOT NULL,
+    standalone   TEXT,                -- user: the follow-up rewritten to stand alone; NULL if unchanged
+    route        TEXT,                -- assistant: 'rag' or 'sql'
+    sql          TEXT,                -- assistant: the query that ran (SQL route)
+    note         TEXT,                -- assistant: e.g. that SQL fell back to search
+    sources_json TEXT,                -- assistant: the cited pages (RAG route)
+    rows_json    TEXT,                -- assistant: the query's rows (SQL route)
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX messages_chat ON messages (chat_id);
 
 -- Read-only views that text-to-SQL is allowed to query (and nothing else).
 CREATE VIEW documents_v AS

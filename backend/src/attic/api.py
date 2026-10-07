@@ -7,6 +7,7 @@ localhost: the archive is personal and there is no authentication.
 
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from attic import config
 from attic.ask import ask
+from attic.chat import create_chat, delete_chat, get_chat, list_chats, rename_chat, send_message
 from attic.config import Paths, get_paths
 from attic.db import connect, init_db
 from attic.extract import DocType, SpendCategory, VehicleService
@@ -93,6 +95,36 @@ class AskRequest(BaseModel):
     """
 
     question: str = Field(min_length=1)
+
+
+class ChatCreate(BaseModel):
+    """A new chat.
+
+    Attributes:
+        title (str | None): Title; omitted means it is named after its first question.
+    """
+
+    title: str | None = None
+
+
+class ChatRename(BaseModel):
+    """A chat's new title.
+
+    Attributes:
+        title (str): The title.
+    """
+
+    title: str
+
+
+class ChatMessageRequest(BaseModel):
+    """A message in a chat.
+
+    Attributes:
+        text (str): The question or follow-up, in plain English.
+    """
+
+    text: str = Field(min_length=1)
 
 
 app = FastAPI(title="attic", description="Local archive of scanned paper.")
@@ -521,6 +553,107 @@ def post_ask(conn: Db, paths: P, request: AskRequest) -> dict[str, Any]:
         "rows": answer.rows,
         "sources": [hit.__dict__ for hit in answer.sources],
     }
+
+
+@app.get("/api/chats")
+def get_chats(conn: Db) -> list[dict[str, Any]]:
+    """Every chat, most recently active first."""
+    return [asdict(chat) for chat in list_chats(conn)]
+
+
+@app.post("/api/chats")
+def post_chat(conn: Db, request: ChatCreate) -> dict[str, Any]:
+    """Start a new, empty chat."""
+    return asdict(create_chat(conn, request.title))
+
+
+@app.get("/api/chats/{chat_id}")
+def get_chat_messages(conn: Db, chat_id: str) -> dict[str, Any]:
+    """One chat with all its messages, oldest first.
+
+    Args:
+        conn (Db): Open archive database.
+        chat_id (str): Chat to read.
+
+    Returns:
+        dict[str, Any]: `{"chat": ..., "messages": [...]}`.
+
+    Raises:
+        HTTPException: 404 if there is no such chat.
+    """
+    try:
+        chat, messages = get_chat(conn, chat_id)
+    except KeyError as e:
+        raise HTTPException(404, f"no chat {chat_id}") from e
+    return {"chat": asdict(chat), "messages": [asdict(m) for m in messages]}
+
+
+@app.patch("/api/chats/{chat_id}")
+def patch_chat(conn: Db, chat_id: str, request: ChatRename) -> dict[str, Any]:
+    """Rename a chat.
+
+    Args:
+        conn (Db): Open archive database.
+        chat_id (str): Chat to rename.
+        request (ChatRename): The new title.
+
+    Returns:
+        dict[str, Any]: The renamed chat.
+
+    Raises:
+        HTTPException: 404 if there is no such chat.
+    """
+    try:
+        return asdict(rename_chat(conn, chat_id, request.title))
+    except KeyError as e:
+        raise HTTPException(404, f"no chat {chat_id}") from e
+
+
+@app.delete("/api/chats/{chat_id}")
+def delete_chat_messages(conn: Db, chat_id: str) -> dict[str, str]:
+    """Delete a chat and its messages; documents are not touched.
+
+    Args:
+        conn (Db): Open archive database.
+        chat_id (str): Chat to delete.
+
+    Returns:
+        dict[str, str]: `{"status": "ok"}`.
+
+    Raises:
+        HTTPException: 404 if there is no such chat.
+    """
+    if not delete_chat(conn, chat_id):
+        raise HTTPException(404, f"no chat {chat_id}")
+    return {"status": "ok"}
+
+
+@app.post("/api/chats/{chat_id}/messages")
+def post_chat_message(conn: Db, paths: P, chat_id: str, request: ChatMessageRequest) -> dict[str, Any]:
+    """Ask a question or follow-up in a chat.
+
+    Args:
+        conn (Db): Open archive database.
+        paths (P): Archive locations.
+        chat_id (str): Chat to add to.
+        request (ChatMessageRequest): The message.
+
+    Returns:
+        dict[str, Any]: `{"user": ..., "assistant": ...}`, the two stored messages.
+
+    Raises:
+        HTTPException: 404 if there is no such chat, 422 if the message is blank,
+            503 if the local model isn't reachable.
+    """
+    try:
+        user, reply = send_message(conn, paths, chat_id, request.text)
+    except KeyError as e:
+        raise HTTPException(404, f"no chat {chat_id}") from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    except Exception as e:
+        raise HTTPException(503, f"could not reach the local model: {e}") from e
+    return {"user": asdict(user), "assistant": asdict(reply)}
 
 
 @app.get("/api/pages/{page_id}/image")
